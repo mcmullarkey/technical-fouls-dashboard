@@ -1,0 +1,17 @@
+file: games-tech-elnet.rds
+file_size: 377843
+pin_hash: 314feef2050c63ea
+type: rds
+title: 'games-tech-elnet: a pinned list'
+description: A glmnet classification modeling workflow
+tags: ~
+urls: ~
+created: 20250129T023648Z
+api_version: 1
+user:
+  required_pkgs:
+  - glmnet
+  - parsnip
+  - recipes
+  - workflows
+  renv_lock: ~

@@ -1,0 +1,16 @@
+file: games-tech-xgb.rds
+file_size: 5507
+pin_hash: ff4f5c290a773fb5
+type: rds
+title: 'games-tech-xgb: a pinned list'
+description: A glmnet classification modeling workflow
+tags: ~
+urls: ~
+created: 20250129T015619Z
+api_version: 1
+user:
+  required_pkgs:
+  - glmnet
+  - parsnip
+  - workflows
+  renv_lock: ~
