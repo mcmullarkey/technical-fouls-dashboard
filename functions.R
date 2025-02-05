@@ -32,7 +32,10 @@ main <- function(config_path = "config.yml") {
         log_info("- Created at: {eligibility_info$timestamp}")
       }
 
-      run_model_training()
+      # run_model_training()
+
+      report <- generate_prediction_report()
+      save_prediction_report(report)
 
       # # Initialize parallel processing
       # workers <- get_config("feature_store.max_parallel_workers")
@@ -951,7 +954,11 @@ train_linear_model <- function(
   ) |>
     # Remove ID/metadata columns
     update_role(
-      c(game_id, home_team_name, away_team_name),
+      c(
+        game_id,
+        home_team_name,
+        away_team_name
+      ),
       new_role = "id"
     ) |>
     # Remove zero variance predictors
@@ -1054,4 +1061,233 @@ save_model_artifacts <- function(results) {
 
   log_info("Saved model artifacts to: {models_dir}")
   models_dir
+}
+
+#' Calculate team performance metrics
+#' @param data Data frame with predictions and actuals
+#' @return Data frame of team metrics
+calculate_team_metrics <- function(data) {
+  # Calculate point differential (actual - predicted)
+  predictions_with_diff <- data |>
+    mutate(
+      points_vs_expected = next_play_score - .pred,
+      abs_error = abs(next_play_score - .pred)
+    ) |>
+    # Create proper team name mapping
+    mutate(
+      # For the offensive team (team_id)
+      offense_team_name = case_when(
+        team_id == home_team_id ~ home_team_name,
+        team_id == away_team_id ~ away_team_name,
+        TRUE ~ NA_character_
+      ),
+      # For the defensive team (receiving_team_id)
+      defense_team_name = case_when(
+        receiving_team_id == home_team_id ~ home_team_name,
+        receiving_team_id == away_team_id ~ away_team_name,
+        TRUE ~ NA_character_
+      )
+    )
+
+  # Calculate metrics for offense (team causing turnover)
+  offense_metrics <- predictions_with_diff |>
+    group_by(team_id, team_name = offense_team_name) |>
+    summarise(
+      n_turnovers = n(),
+      avg_points_after = mean(next_play_score, na.rm = TRUE),
+      avg_predicted_points = mean(.pred, na.rm = TRUE),
+      points_vs_expected = mean(points_vs_expected, na.rm = TRUE),
+      mae = mean(abs_error, na.rm = TRUE),
+      total_points_vs_expected = sum(points_vs_expected, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(points_vs_expectation = total_points_vs_expected * n_turnovers) |>
+    arrange(desc(points_vs_expectation))
+
+  # Calculate metrics for defense (receiving team)
+  defense_metrics <- predictions_with_diff |>
+    group_by(receiving_team_id, defense_team = defense_team_name) |>
+    summarise(
+      n_turnovers_forced = n(),
+      avg_points_allowed = mean(next_play_score, na.rm = TRUE),
+      avg_predicted_points_allowed = mean(.pred, na.rm = TRUE),
+      points_vs_expected_defense = mean(points_vs_expected, na.rm = TRUE),
+      mae_defense = mean(abs_error, na.rm = TRUE),
+      total_points_vs_expected_defense = sum(points_vs_expected, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(desc(total_points_vs_expected_defense))
+
+  # Add validation checks
+  if (any(duplicated(offense_metrics$team_id))) {
+    log_warn("Duplicate team IDs found in offense metrics")
+  }
+  if (any(duplicated(defense_metrics$receiving_team_id))) {
+    log_warn("Duplicate team IDs found in defense metrics")
+  }
+
+  # Return both sets of metrics
+  list(
+    offense = offense_metrics,
+    defense = defense_metrics
+  )
+}
+
+#' Generate prediction performance report
+#' @return List containing predictions and team metrics
+generate_prediction_report <- function() {
+  log_info("Starting prediction performance analysis")
+
+  # Get latest workflow and prediction data
+  workflow <- get_latest_workflow()
+  pred_data <- get_prediction_data()
+
+  log_info(
+    "Available columns in prediction data: {paste(names(pred_data), collapse=', ')}"
+  )
+
+  # Prepare data for prediction (using same columns as training)
+  pred_data_reduced <- pred_data |>
+    select(
+      game_id,
+      team_id,
+      receiving_team_id,
+      home_team_id,
+      away_team_id,
+      home_team_name,
+      away_team_name,
+      away_score,
+      home_score,
+      period_number,
+      end_quarter_seconds_remaining,
+      coordinate_x,
+      coordinate_y,
+      next_play_score
+    ) |>
+    mutate(
+      across(
+        where(is.character),
+        as.factor
+      )
+    )
+
+  # Generate predictions
+  log_info("Generating predictions for {nrow(pred_data_reduced)} plays")
+  predictions <- augment(workflow, new_data = pred_data_reduced)
+
+  # Calculate team metrics
+  log_info("Calculating team performance metrics")
+  team_metrics <- calculate_team_metrics(predictions)
+
+  # Calculate overall metrics
+  overall_metrics <- predictions |>
+    metrics(truth = next_play_score, estimate = .pred)
+
+  log_info("Overall prediction metrics:")
+  print(overall_metrics)
+
+  log_info("Top 5 teams by offensive points vs expected:")
+  print(
+    head(
+      team_metrics$offense[,
+        c("team_name", "points_vs_expected", "n_turnovers")
+      ],
+      5
+    )
+  )
+
+  log_info("Top 5 teams by defensive points vs expected:")
+  print(
+    head(
+      team_metrics$defense[,
+        c("defense_team", "points_vs_expected_defense", "n_turnovers_forced")
+      ],
+      5
+    )
+  )
+
+  # Return results
+  list(
+    predictions = predictions,
+    team_metrics = team_metrics,
+    overall_metrics = overall_metrics
+  )
+}
+
+#' Get latest model workflow
+#' @return Latest model workflow
+get_latest_workflow <- function() {
+  base_path <- get_config("paths.base_dir")
+  models_dir <- file.path(base_path, "models")
+
+  # Get all model directories
+  model_dirs <- list.dirs(models_dir, full.names = TRUE, recursive = FALSE)
+  if (length(model_dirs) == 0) {
+    stop("No model directories found in: ", models_dir)
+  }
+
+  # Get most recent model directory
+  latest_dir <- model_dirs[which.max(file.info(model_dirs)$mtime)]
+  workflow_path <- file.path(latest_dir, "workflow.rds")
+
+  if (!file.exists(workflow_path)) {
+    stop("Workflow file not found in latest model directory: ", workflow_path)
+  }
+
+  log_info("Loading workflow from: {workflow_path}")
+  readRDS(workflow_path)
+}
+
+#' Get prediction data from most recent version
+#' @return Prediction-eligible data
+get_prediction_data <- function() {
+  # Reuse get_training_data but filter for prediction eligible
+  base_path <- get_config("paths.base_dir")
+  versions_dir <- file.path(base_path, "versions")
+
+  version_dirs <- list.dirs(versions_dir, full.names = TRUE, recursive = FALSE)
+  latest_version <- version_dirs[which.max(file.info(version_dirs)$mtime)]
+  version_hash <- basename(latest_version)
+
+  features_path <- file.path(latest_version, "features.parquet")
+  if (!file.exists(features_path)) {
+    stop("Features file not found: ", features_path)
+  }
+
+  # Read and filter for prediction eligible rows (not training eligible)
+  features_df <- read_parquet(features_path) |>
+    filter(!is_training_eligible)
+
+  log_info("Retrieved {nrow(features_df)} prediction eligible rows")
+  features_df
+}
+
+#' Save prediction report
+#' @param report Prediction report from generate_prediction_report()
+#' @return Path to saved report
+save_prediction_report <- function(report) {
+  run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  base_path <- get_config("paths.base_dir")
+  reports_dir <- file.path(base_path, "prediction_reports", run_id)
+  dir.create(reports_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Save full report
+  saveRDS(report, file.path(reports_dir, "prediction_report.rds"))
+
+  # Save CSV files for easy access
+  write_csv(
+    report$team_metrics$offense,
+    file.path(reports_dir, "offense_metrics.csv")
+  )
+  write_csv(
+    report$team_metrics$defense,
+    file.path(reports_dir, "defense_metrics.csv")
+  )
+  write_csv(
+    report$overall_metrics,
+    file.path(reports_dir, "overall_metrics.csv")
+  )
+
+  log_info("Saved prediction report to: {reports_dir}")
+  reports_dir
 }

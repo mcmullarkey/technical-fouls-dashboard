@@ -15,6 +15,7 @@ library(jsonlite)
 library(R6)
 library(testthat)
 library(tidymodels)
+library(readr)
 
 # Function to ensure all required packages are installed and loaded
 ensure_packages <- function() {
@@ -34,7 +35,8 @@ ensure_packages <- function() {
     "jsonlite",
     "R6",
     "testthat",
-    "tidymodels"
+    "tidymodels",
+    "readr"
   )
 
   # Check for missing packages
