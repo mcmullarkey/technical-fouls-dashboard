@@ -16,6 +16,8 @@ library(R6)
 library(testthat)
 library(tidymodels)
 library(readr)
+library(tinytable)
+library(aws.s3)
 
 # Function to ensure all required packages are installed and loaded
 ensure_packages <- function() {
@@ -36,7 +38,9 @@ ensure_packages <- function() {
     "R6",
     "testthat",
     "tidymodels",
-    "readr"
+    "readr",
+    "tinytable",
+    "aws.s3"
   )
 
   # Check for missing packages

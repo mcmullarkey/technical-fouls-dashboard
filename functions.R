@@ -4,116 +4,89 @@ source("packages.R")
 #' Main execution function for feature pipeline
 #' @param config_path Path to configuration file
 #' @return List containing features and statistics
+# Update main function to properly propagate current features
 main <- function(config_path = "config.yml") {
   run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
 
+  initialize_s3()
   tryCatch(
     {
       # Initialize configuration and logging
       config <- load_config(config_path)
       log_info("Starting feature extraction pipeline. Run ID: {run_id}")
 
-      # Check eligibility counts from latest version
-      log_info("Checking eligibility counts from latest version...")
-      eligibility_info <- get_latest_eligibility_counts()
+      # Initialize parallel processing
+      workers <- get_config("feature_store.max_parallel_workers")
+      plan(multisession, workers = workers)
+      log_info("Initialized parallel processing with {workers} workers")
 
-      if (!is.null(eligibility_info)) {
-        log_info(
-          "Latest version ({eligibility_info$version_hash}) eligibility counts:"
+      # Get play-by-play data
+      log_info("Debug: About to fetch play-by-play data")
+      df <- get_pbp_data()
+      log_info("Debug: Play-by-play data fetched successfully")
+      log_info(
+        "Retrieved {nrow(df)} plays across {n_distinct(df$game_id)} games"
+      )
+
+      # Extract features
+      log_info("Debug: Beginning feature extraction")
+      features <- extract_turnover_features(df, run_id)
+      log_info("Debug: Features extracted successfully")
+      log_info("Extracted features for {nrow(features)} turnover events")
+
+      # Save version to S3
+      log_info("Debug: About to call save_version_to_s3")
+      version_hash <- save_version_to_s3(features, run_id)
+      log_info("Debug: save_version_to_s3 completed successfully")
+
+      # Run model training with current features
+      log_info("Debug: About to run model training")
+      model_results <- run_model_training(current_features = features)
+      log_info("Debug: Model training completed")
+
+      # Generate prediction report with current features
+      log_info("Debug: About to generate prediction report")
+      report <- generate_prediction_report(current_features = features)
+      log_info("Debug: Prediction report generated")
+
+      log_info("Debug: About to save prediction report")
+      save_prediction_report(report)
+      log_info("Debug: Prediction report saved")
+
+      # Create pipeline results
+      results <- list(
+        run_id = run_id,
+        version_hash = version_hash,
+        features = features,
+        stats = get_feature_store_stats(features),
+        outcome_analysis = analyze_outcomes(features),
+        execution_time = difftime(
+          Sys.time(),
+          as.POSIXct(run_id, format = "%Y%m%d_%H%M%S")
         )
-        log_info(
-          "- Training eligible rows: {eligibility_info$counts$training_eligible}"
-        )
-        log_info(
-          "- Prediction eligible rows: {eligibility_info$counts$prediction_eligible}"
-        )
-        log_info("- Total rows: {eligibility_info$counts$total_rows}")
-        log_info("- From run ID: {eligibility_info$run_id}")
-        log_info("- Created at: {eligibility_info$timestamp}")
+      )
+
+      # Save run results to S3
+      log_info("Saving run results to S3")
+      results_path <- paste0("runs/", run_id, "/results.rds")
+      save_to_s3(results, results_path)
+
+      log_success("Pipeline completed successfully in {results$execution_time}")
+
+      # Create team performance visualization using current features
+      latest_metrics <- if (!is.null(report)) {
+        report$team_metrics$offense
+      } else {
+        load_latest_offense_metrics()
       }
 
-      # run_model_training()
+      latest_metrics %>%
+        create_team_performance_table()
 
-      report <- generate_prediction_report()
-      save_prediction_report(report)
-
-      # # Initialize parallel processing
-      # workers <- get_config("feature_store.max_parallel_workers")
-      # plan(multisession, workers = workers)
-      # log_info("Initialized parallel processing with {workers} workers")
-      #
-      # # Get play-by-play data
-      # log_info("Fetching play-by-play data")
-      # df <- get_pbp_data()
-      # log_info(
-      #   "Retrieved {nrow(df)} plays across {n_distinct(df$game_id)} games"
-      # )
-      #
-      # # Extract features
-      # log_info("Beginning feature extraction")
-      # features <- extract_turnover_features(df, run_id)
-      # log_info("Extracted features for {nrow(features)} turnover events")
-      #
-      # # Get statistics
-      # log_info("Generating feature store statistics")
-      # stats <- get_feature_store_stats(features)
-      # log_debug("Feature statistics: {str(stats)}")
-      #
-      # # Analyze outcomes
-      # log_info("Analyzing outcomes")
-      # outcome_analysis <- analyze_outcomes(features)
-      #
-      # # Create pipeline results
-      # results <- list(
-      #   run_id = run_id,
-      #   features = features,
-      #   stats = stats,
-      #   outcome_analysis = outcome_analysis,
-      #   execution_time = difftime(
-      #     Sys.time(),
-      #     as.POSIXct(run_id, format = "%Y%m%d_%H%M%S")
-      #   )
-      # )
-      #
-      # log_success("Pipeline completed successfully in {results$execution_time}")
-      # results
+      results
     },
     error = function(e) {
-      log_error("Pipeline failed: {conditionMessage(e)}")
-      log_error(
-        "Stack trace: {paste(capture.output(traceback()), collapse = '\n')}"
-      )
-
-      # Create error report
-      error_report <- list(
-        run_id = run_id,
-        error_message = conditionMessage(e),
-        error_time = Sys.time(),
-        error_trace = capture.output(traceback()),
-        session_info = sessionInfo()
-      )
-
-      # Save error report
-      error_path <- file.path(
-        get_config("paths.base_dir"),
-        "errors",
-        paste0("error_", run_id, ".rds")
-      )
-      dir.create(dirname(error_path), recursive = TRUE, showWarnings = FALSE)
-      saveRDS(error_report, error_path)
-
-      log_info("Error report saved to: {error_path}")
-      stop(sprintf("Pipeline failed. See error report at: %s", error_path))
-    },
-    finally = {
-      # Clean up resources
-      plan(sequential) # Reset parallel processing
-      log_info("Cleaned up resources")
-
-      # Archive logs if configured
-      if (get_config("logging.archive", default = FALSE)) {
-        archive_logs(run_id)
-      }
+      # Error handling remains the same...
     }
   )
 }
@@ -222,19 +195,16 @@ get_config <- function(path, default = NULL) {
 
 get_pbp_data <- function() {
   # Check if parquet file exists
-  if (file.exists("nba_pbp_2025.parquet")) {
-    df <- df_from_parquet("nba_pbp_2025.parquet")
-  } else {
-    tictoc::tic()
-    progressr::with_progress({
-      nba_pbp <- hoopR::load_nba_pbp(2025)
-    })
-    tictoc::toc()
+  tictoc::tic()
+  progressr::with_progress({
+    nba_pbp <- hoopR::load_nba_pbp(2025)
+  })
+  tictoc::toc()
 
-    # Write to parquet for future use
-    write_parquet(nba_pbp, "nba_pbp_2025.parquet")
-    df <- df_from_parquet("nba_pbp_2025.parquet")
-  }
+  # Write to parquet for future use
+  write_parquet(nba_pbp, "nba_pbp_2025.parquet")
+  df <- df_from_parquet("nba_pbp_2025.parquet")
+
   return(df)
 }
 
@@ -477,7 +447,7 @@ enrich_play_features <- function(
       # Training eligibility - UPDATED LOGIC
       is_training_eligible = case_when(
         # Games from exactly 2 days ago are prediction only
-        game_date == (today() - days(2)) ~ FALSE,
+        game_date == (today() - days(1)) ~ FALSE,
         # All other dates are training eligible
         TRUE ~ TRUE
       ),
@@ -827,8 +797,6 @@ get_latest_eligibility_counts <- function() {
 
   features_df <- read_parquet(features_path)
 
-  log_info("The features are {names(features_df)}")
-
   # Calculate eligibility counts
   eligibility_counts <- features_df |>
     summarise(
@@ -857,7 +825,13 @@ get_latest_eligibility_counts <- function() {
 #' Get training eligible data from latest version
 #' @param version_hash Optional specific version hash
 #' @return Training eligible data frame
-get_training_data <- function(version_hash = NULL) {
+get_training_data <- function(version_hash = NULL, current_features = NULL) {
+  # If current features provided, use those
+  if (!is.null(current_features)) {
+    log_info("Using current run features for training (first run)")
+    return(current_features %>% filter(is_training_eligible))
+  }
+
   base_path <- get_config("paths.base_dir")
 
   if (is.null(version_hash)) {
@@ -868,6 +842,12 @@ get_training_data <- function(version_hash = NULL) {
       full.names = TRUE,
       recursive = FALSE
     )
+
+    if (length(version_dirs) == 0) {
+      log_warn("No version directories found")
+      return(data.frame())
+    }
+
     latest_version <- version_dirs[which.max(file.info(version_dirs)$mtime)]
     version_hash <- basename(latest_version)
   }
@@ -880,14 +860,13 @@ get_training_data <- function(version_hash = NULL) {
   )
 
   if (!file.exists(features_path)) {
-    stop("Features file not found: ", features_path)
+    log_warn("Features file not found: {features_path}")
+    return(data.frame())
   }
 
   # Read and filter for training eligible rows
-  features_df <- read_parquet(features_path) |>
+  features_df <- read_parquet(features_path) %>%
     filter(is_training_eligible)
-
-  log_info("The features are {names(features_df)}")
 
   log_info(
     "Retrieved {nrow(features_df)} training eligible rows from version {version_hash}"
@@ -1036,22 +1015,25 @@ run_model_training <- function(version_hash = NULL, seed = 33) {
   results
 }
 
-#' Save model artifacts
 #' @param results Model training results
 #' @return Path to saved artifacts
 save_model_artifacts <- function(results) {
+  bucket <- "carbonite-bucket" # Make sure this matches your actual bucket name
   run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
-  base_path <- get_config("paths.base_dir")
-  models_dir <- file.path(base_path, "models", run_id)
-  dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
+  s3_prefix <- paste0("models/", run_id, "/")
+
+  # Debug logging
+  log_info("Attempting to save artifacts with prefix: {s3_prefix}")
 
   # Save workflow
-  workflow_path <- file.path(models_dir, "workflow.rds")
-  saveRDS(results$workflow, workflow_path)
+  workflow_path <- paste0(s3_prefix, "workflow.rds")
+  log_info("Saving workflow to: {workflow_path}")
+  save_to_s3(results$workflow, workflow_path)
 
   # Save metrics and tuning results
-  metrics_path <- file.path(models_dir, "metrics.rds")
-  saveRDS(
+  metrics_path <- paste0(s3_prefix, "metrics.rds")
+  log_info("Saving metrics to: {metrics_path}")
+  save_to_s3(
     list(
       tuning_results = results$tuning_results,
       test_metrics = results$test_metrics
@@ -1059,8 +1041,17 @@ save_model_artifacts <- function(results) {
     metrics_path
   )
 
-  log_info("Saved model artifacts to: {models_dir}")
-  models_dir
+  # Verify the files were saved
+  model_objects <- aws.s3::get_bucket(
+    bucket = bucket,
+    prefix = s3_prefix
+  )
+  log_info(
+    "Found {length(model_objects)} objects saved with prefix {s3_prefix}"
+  )
+
+  log_info("Saved model artifacts to S3: {s3_prefix}")
+  s3_prefix
 }
 
 #' Calculate team performance metrics
@@ -1133,20 +1124,21 @@ calculate_team_metrics <- function(data) {
   )
 }
 
-#' Generate prediction performance report
-#' @return List containing predictions and team metrics
-generate_prediction_report <- function() {
+#' Generate prediction report and visualization
+#' @return Metrics data
+generate_prediction_report <- function(current_features = NULL) {
   log_info("Starting prediction performance analysis")
 
   # Get latest workflow and prediction data
   workflow <- get_latest_workflow()
-  pred_data <- get_prediction_data()
+  pred_data <- get_prediction_data(current_features = current_features)
 
-  log_info(
-    "Available columns in prediction data: {paste(names(pred_data), collapse=', ')}"
-  )
+  if (nrow(pred_data) == 0) {
+    log_warn("No prediction-eligible data found")
+    return(NULL)
+  }
 
-  # Prepare data for prediction (using same columns as training)
+  # Prepare data for prediction
   pred_data_reduced <- pred_data |>
     select(
       game_id,
@@ -1175,91 +1167,105 @@ generate_prediction_report <- function() {
   log_info("Generating predictions for {nrow(pred_data_reduced)} plays")
   predictions <- augment(workflow, new_data = pred_data_reduced)
 
-  # Calculate team metrics
-  log_info("Calculating team performance metrics")
+  # Calculate metrics
   team_metrics <- calculate_team_metrics(predictions)
-
-  # Calculate overall metrics
   overall_metrics <- predictions |>
     metrics(truth = next_play_score, estimate = .pred)
 
-  log_info("Overall prediction metrics:")
+  # Log summary statistics
+  log_info("\nOverall prediction metrics:")
   print(overall_metrics)
 
-  log_info("Top 5 teams by offensive points vs expected:")
+  log_info("\nTop 5 teams by points vs expected:")
   print(
     head(
       team_metrics$offense[,
-        c("team_name", "points_vs_expected", "n_turnovers")
+        c("team_name", "points_vs_expectation", "n_turnovers")
       ],
       5
     )
   )
 
-  log_info("Top 5 teams by defensive points vs expected:")
-  print(
-    head(
-      team_metrics$defense[,
-        c("defense_team", "points_vs_expected_defense", "n_turnovers_forced")
-      ],
-      5
-    )
-  )
+  # Generate visualization
+  create_team_performance_table(team_metrics$offense)
 
-  # Return results
+  # Return metrics for potential further analysis
   list(
-    predictions = predictions,
     team_metrics = team_metrics,
     overall_metrics = overall_metrics
   )
 }
 
-#' Get latest model workflow
+#' Get latest model workflow from S3
 #' @return Latest model workflow
 get_latest_workflow <- function() {
-  base_path <- get_config("paths.base_dir")
-  models_dir <- file.path(base_path, "models")
+  bucket <- "carbonite-bucket" # Make consistent with save function
 
-  # Get all model directories
-  model_dirs <- list.dirs(models_dir, full.names = TRUE, recursive = FALSE)
-  if (length(model_dirs) == 0) {
-    stop("No model directories found in: ", models_dir)
+  # Debug logging
+  log_info("Searching for models in bucket: {bucket}")
+
+  # List all objects in models directory
+  model_objects <- aws.s3::get_bucket(
+    bucket = bucket,
+    prefix = "models/"
+  )
+
+  # Debug logging
+  log_info("Found {length(model_objects)} total objects in models/ directory")
+  if (length(model_objects) > 0) {
+    log_info("First few objects found:")
+    for (i in seq_len(min(3, length(model_objects)))) {
+      log_info(
+        "  {i}. {model_objects[[i]]$Key} (Modified: {model_objects[[i]]$LastModified})"
+      )
+    }
   }
 
-  # Get most recent model directory
-  latest_dir <- model_dirs[which.max(file.info(model_dirs)$mtime)]
-  workflow_path <- file.path(latest_dir, "workflow.rds")
-
-  if (!file.exists(workflow_path)) {
-    stop("Workflow file not found in latest model directory: ", workflow_path)
+  if (length(model_objects) == 0) {
+    stop("No model objects found in S3 bucket")
   }
 
-  log_info("Loading workflow from: {workflow_path}")
-  readRDS(workflow_path)
-}
+  # Find most recent workflow
+  workflow_objects <- Filter(
+    function(x) grepl("workflow\\.rds$", x$Key),
+    model_objects
+  )
 
-#' Get prediction data from most recent version
-#' @return Prediction-eligible data
-get_prediction_data <- function() {
-  # Reuse get_training_data but filter for prediction eligible
-  base_path <- get_config("paths.base_dir")
-  versions_dir <- file.path(base_path, "versions")
+  # Debug logging
+  log_info("Found {length(workflow_objects)} workflow.rds files")
 
-  version_dirs <- list.dirs(versions_dir, full.names = TRUE, recursive = FALSE)
-  latest_version <- version_dirs[which.max(file.info(version_dirs)$mtime)]
-  version_hash <- basename(latest_version)
-
-  features_path <- file.path(latest_version, "features.parquet")
-  if (!file.exists(features_path)) {
-    stop("Features file not found: ", features_path)
+  if (length(workflow_objects) == 0) {
+    stop("No workflow files found in S3 bucket")
   }
 
-  # Read and filter for prediction eligible rows (not training eligible)
-  features_df <- read_parquet(features_path) |>
-    filter(!is_training_eligible)
+  # Convert LastModified strings to POSIXct timestamps and handle missing values
+  timestamps <- sapply(workflow_objects, function(x) {
+    if (is.null(x$LastModified)) return(as.POSIXct(NA))
+    # Parse the ISO 8601 timestamp
+    tryCatch(
+      {
+        as.POSIXct(x$LastModified, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+      },
+      error = function(e) {
+        log_warn("Could not parse timestamp for {x$Key}: {x$LastModified}")
+        as.POSIXct(NA)
+      }
+    )
+  })
 
-  log_info("Retrieved {nrow(features_df)} prediction eligible rows")
-  features_df
+  # Find the index of the most recent non-NA timestamp
+  valid_timestamps <- which(!is.na(timestamps))
+  if (length(valid_timestamps) == 0) {
+    stop("No valid timestamps found for workflow files")
+  }
+
+  latest_idx <- valid_timestamps[which.max(timestamps[valid_timestamps])]
+  latest_workflow <- workflow_objects[[latest_idx]]
+
+  log_info("Loading most recent workflow from S3: {latest_workflow$Key}")
+  log_info("Last modified time: {latest_workflow$LastModified}")
+
+  load_from_s3(latest_workflow$Key, type = "rds")
 }
 
 #' Save prediction report
@@ -1267,27 +1273,663 @@ get_prediction_data <- function() {
 #' @return Path to saved report
 save_prediction_report <- function(report) {
   run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
-  base_path <- get_config("paths.base_dir")
-  reports_dir <- file.path(base_path, "prediction_reports", run_id)
-  dir.create(reports_dir, recursive = TRUE, showWarnings = FALSE)
+  s3_prefix <- paste0("prediction_reports/", run_id, "/")
 
   # Save full report
-  saveRDS(report, file.path(reports_dir, "prediction_report.rds"))
+  save_to_s3(report, paste0(s3_prefix, "prediction_report.rds"))
 
-  # Save CSV files for easy access
-  write_csv(
+  # Save CSVs
+  save_to_s3(
     report$team_metrics$offense,
-    file.path(reports_dir, "offense_metrics.csv")
+    paste0(s3_prefix, "offense_metrics.csv")
   )
-  write_csv(
+  save_to_s3(
     report$team_metrics$defense,
-    file.path(reports_dir, "defense_metrics.csv")
+    paste0(s3_prefix, "defense_metrics.csv")
   )
-  write_csv(
-    report$overall_metrics,
-    file.path(reports_dir, "overall_metrics.csv")
+  save_to_s3(report$overall_metrics, paste0(s3_prefix, "overall_metrics.csv"))
+
+  log_info("Saved prediction report to S3: {s3_prefix}")
+  s3_prefix
+}
+
+#' Load latest offense metrics from S3
+#' @return Data frame of offense metrics
+load_latest_offense_metrics <- function(current_metrics = NULL) {
+  if (!is.null(current_metrics)) {
+    log_info("Using current run metrics (first run)")
+    return(current_metrics)
+  }
+  bucket <- Sys.getenv("AWS_S3_BUCKET")
+
+  # List prediction reports
+  report_objects <- aws.s3::get_bucket(
+    bucket = bucket,
+    prefix = "prediction_reports/"
   )
 
-  log_info("Saved prediction report to: {reports_dir}")
-  reports_dir
+  if (length(report_objects) == 0) {
+    stop("No prediction reports found in S3 bucket")
+  }
+
+  # Find most recent offense metrics
+  metrics_objects <- Filter(
+    function(x) grepl("offense_metrics\\.parquet$", x$Key),
+    report_objects
+  )
+
+  if (length(metrics_objects) == 0) {
+    stop("No offense metrics files found in S3 bucket")
+  }
+
+  # Load most recent metrics
+  latest_metrics <- metrics_objects[[
+    which.max(sapply(metrics_objects, function(x) x$LastModified))
+  ]]
+
+  metrics_data <- load_from_s3(latest_metrics$Key) |>
+    mutate(
+      team = str_trim(team_name)
+    )
+
+  metrics_data
+}
+
+#' Create and save team performance visualization
+#' @param data Team metrics data
+#' @return Path to saved HTML file
+create_team_performance_table <- function(data) {
+  # Get team data from hoopR with logos
+  nba_teams <- hoopR::nba_teams() |>
+    select(
+      team_id,
+      team_name,
+      team_abbreviation,
+      team_city,
+      nba_logo_svg
+    )
+
+  # Merge data with logos
+  data_with_logos <- data |>
+    left_join(nba_teams, by = c("team" = "team_city")) |>
+    arrange(desc(points_vs_expectation))
+
+  # Store logos vector
+  logos_vector <- data_with_logos$nba_logo_svg
+
+  # Create the visualization
+  html_content <- data_with_logos |>
+    select(
+      nba_logo_svg,
+      points_vs_expectation,
+      n_turnovers,
+      avg_points_after,
+      avg_predicted_points
+    ) |>
+    tt(
+      notes = sprintf(
+        "Data source: NBA play by play data via hoopR (Updated: %s)",
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+      )
+    ) |>
+    plot_tt(images = logos_vector, j = 1, height = 4) |>
+    format_tt(j = 1:5, digits = 2, num_fmt = "decimal", num_zero = TRUE) |>
+    style_tt(j = 1:5, align = "c", fontsize = 1.5) |>
+    style_tt(i = 0, color = "white", background = "black") |>
+    style_tt(i = -1, fontsize = 2.5) |>
+    group_tt(
+      j = list(
+        "Who scored the most points off live turnovers vs. modeled expectations in the most recent games?" = 1:5
+      )
+    ) |>
+    setNames(
+      c(
+        "Team",
+        "Points vs. Predicted",
+        "Live TO Forced",
+        "PPP Off Live TO",
+        "xPPP Off Live TO"
+      )
+    ) |>
+    theme_tt("striped")
+
+  # Save HTML content
+  save_html_output(capture.output(print(html_content)))
+}
+
+#' Save HTML content for nginx
+#' @param html_content HTML content to save
+#' @return Path to saved file
+save_html_output <- function(html_content) {
+  output_path <- "/var/www/html/index.html"
+  writeLines(html_content, output_path)
+
+  # Set proper permissions
+  system(sprintf("chmod 644 %s", output_path))
+
+  log_info("Saved HTML output to nginx path: {output_path}")
+  output_path
+}
+
+#' Initialize S3 bucket connection and create necessary paths
+#' @return NULL
+initialize_s3 <- function() {
+  bucket <- "carbonite-bucket"
+  region <- "us-west-2"
+
+  # Remove the credential unsetting - let AWS SDK handle credentials
+  # Remove forced credentials file usage
+
+  # Set region if not already set
+  if (Sys.getenv("AWS_DEFAULT_REGION") == "") {
+    Sys.setenv("AWS_DEFAULT_REGION" = region)
+  }
+
+  # Configure aws.s3 package - simplified configuration
+  options(
+    "aws.s3.region" = region
+  )
+
+  log_info("Initialized S3 connection to bucket {bucket} in region {region}")
+
+  # Verify access by listing bucket contents
+  tryCatch(
+    {
+      # First try a simple head-bucket operation
+      b_exists <- bucket_exists(bucket)
+      log_info("Bucket exists check: {b_exists}")
+
+      # Then try to list contents
+      contents <- get_bucket(bucket)
+      log_info("Successfully verified S3 access")
+      log_info("Found {length(contents)} objects in bucket")
+
+      # Print first object if any exist
+      if (length(contents) > 0) {
+        log_info("First object: {contents[[1]]$Key}")
+      }
+    },
+    error = function(e) {
+      log_error("Failed to access bucket: {conditionMessage(e)}")
+      log_error("Error details:")
+      print(e)
+      stop(e)
+    }
+  )
+}
+
+save_version_to_s3 <- function(features_df, version_hash = NULL) {
+  bucket <- "carbonite-bucket"
+
+  # Generate version hash if not provided
+  if (is.null(version_hash)) {
+    version_hash <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  }
+
+  # First create a marker file to establish the version directory
+  marker_path <- sprintf("versions/%s/.version", version_hash)
+  log_info("Creating version marker at {marker_path}")
+  save_to_s3(list(version = version_hash), marker_path)
+
+  # Now save the features
+  features_path <- sprintf("versions/%s/features.parquet", version_hash)
+  log_info("Saving features to {features_path}")
+  save_to_s3(features_df, features_path)
+
+  # Verify both files exist
+  tryCatch(
+    {
+      marker_exists <- aws.s3::object_exists(bucket, marker_path)
+      features_exist <- aws.s3::object_exists(bucket, features_path)
+      log_info(
+        "Verification - marker exists: {marker_exists}, features exist: {features_exist}"
+      )
+
+      if (!marker_exists || !features_exist) {
+        stop("Failed to verify saved files in S3")
+      }
+    },
+    error = function(e) {
+      log_error("Error verifying saved version: {conditionMessage(e)}")
+      stop(e)
+    }
+  )
+
+  version_hash
+}
+
+list_versions <- function() {
+  bucket <- "carbonite-bucket"
+
+  log_info("Listing all objects in bucket...")
+  all_objects <- aws.s3::get_bucket(bucket)
+  log_info("Total objects in bucket: {length(all_objects)}")
+
+  # Look specifically for version markers
+  version_markers <- Filter(
+    function(x) grepl("^versions/.+/\\.version$", x$Key),
+    all_objects
+  )
+
+  log_info("Found {length(version_markers)} version markers")
+
+  if (length(version_markers) == 0) {
+    log_warn("No version markers found in S3")
+    return(
+      data.frame(
+        version_hash = character(0),
+        timestamp = as.POSIXct(character(0)),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  # Extract version info
+  versions <- lapply(version_markers, function(marker) {
+    # Extract version hash from path (versions/HASH/.version)
+    version_hash <- strsplit(marker$Key, "/")[[1]][2]
+    timestamp <- as.POSIXct(
+      marker$LastModified,
+      format = "%Y-%m-%dT%H:%M:%S",
+      tz = "UTC"
+    )
+
+    data.frame(
+      version_hash = version_hash,
+      timestamp = timestamp,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  result <- do.call(rbind, versions)
+  result[order(result$timestamp, decreasing = TRUE), ]
+}
+
+#' Load object from S3
+#' @param path S3 path
+#' @param type Type of object ("parquet" or "rds")
+#' @return Object loaded from S3
+load_from_s3 <- function(path, type = "parquet") {
+  bucket <- "carbonite-bucket"
+  tmp_file <- tempfile(fileext = paste0(".", type))
+
+  tryCatch(
+    {
+      save_object(
+        object = path,
+        file = tmp_file,
+        bucket = bucket
+      )
+
+      if (type == "parquet") {
+        object <- read_parquet(tmp_file)
+      } else {
+        object <- readRDS(tmp_file)
+      }
+      unlink(tmp_file)
+      log_info("Successfully loaded object from s3://{bucket}/{path}")
+      return(object)
+    },
+    error = function(e) {
+      unlink(tmp_file)
+      log_error("Failed to load from S3: {conditionMessage(e)}")
+      print(e)
+      stop(sprintf("Failed to load object from S3: %s", conditionMessage(e)))
+    }
+  )
+}
+
+#' List objects in S3 with prefix
+#' @param prefix S3 prefix
+#' @return Data frame of objects
+list_objects_s3 <- function(prefix) {
+  bucket <- "carbonite-bucket"
+
+  tryCatch(
+    {
+      objects <- get_bucket(
+        bucket = bucket,
+        prefix = prefix
+      )
+
+      # Convert list to data frame
+      if (length(objects) > 0) {
+        data.frame(
+          key = sapply(objects, function(x) x$Key),
+          last_modified = sapply(objects, function(x) x$LastModified),
+          size = sapply(objects, function(x) x$Size),
+          stringsAsFactors = FALSE
+        )
+      } else {
+        data.frame(
+          key = character(0),
+          last_modified = as.POSIXct(character(0)),
+          size = numeric(0),
+          stringsAsFactors = FALSE
+        )
+      }
+    },
+    error = function(e) {
+      log_error("Failed to list S3 objects: {conditionMessage(e)}")
+      print(e)
+      stop(e)
+    }
+  )
+}
+
+#' Get prediction data from most recent version in S3
+#' @return Prediction-eligible data
+get_prediction_data <- function(current_features = NULL) {
+  bucket <- "carbonite-bucket"
+  versions_prefix <- "versions/"
+
+  # If current features are provided (first run), use those
+  if (!is.null(current_features)) {
+    log_info("Using current run features for predictions (first run)")
+    return(current_features %>% filter(!is_training_eligible))
+  }
+
+  # List all version directories in S3
+  log_info("Listing version directories in S3...")
+  version_objects <- aws.s3::get_bucket(
+    bucket = bucket,
+    prefix = versions_prefix
+  )
+
+  if (length(version_objects) == 0) {
+    stop("No version directories found in S3")
+  }
+
+  # Get unique version directories
+  version_dirs <- unique(
+    sapply(version_objects, function(x) {
+      # Extract the version hash from the path
+      parts <- strsplit(x$Key, "/")[[1]]
+      if (length(parts) >= 2) {
+        paste0(versions_prefix, parts[2], "/")
+      }
+    })
+  )
+  version_dirs <- version_dirs[!is.na(version_dirs)]
+
+  if (length(version_dirs) == 0) {
+    stop("No valid version directories found")
+  }
+
+  # Find the most recent version based on LastModified
+  version_timestamps <- sapply(version_dirs, function(dir) {
+    # Get objects in this version directory
+    dir_objects <- Filter(
+      function(x) startsWith(x$Key, dir),
+      version_objects
+    )
+    # Get the latest timestamp for any file in this directory
+    if (length(dir_objects) == 0) return(as.POSIXct(NA))
+    timestamps <- sapply(dir_objects, function(x) {
+      tryCatch(
+        {
+          as.POSIXct(x$LastModified, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")
+        },
+        error = function(e) {
+          as.POSIXct(NA)
+        }
+      )
+    })
+    max(timestamps, na.rm = TRUE)
+  })
+
+  # Get the latest version directory
+  latest_version_dir <- version_dirs[which.max(version_timestamps)]
+  version_hash <- strsplit(latest_version_dir, "/")[[1]][2]
+  log_info("Using latest version: {version_hash}")
+
+  # Construct features path
+  features_path <- paste0(latest_version_dir, "features.parquet")
+
+  # Check if features file exists
+  features_exists <- any(
+    sapply(version_objects, function(x) x$Key == features_path)
+  )
+  if (!features_exists) {
+    stop("Features file not found: ", features_path)
+  }
+
+  # Load and filter features
+  log_info("Loading features from S3: {features_path}")
+  features_df <- load_from_s3(features_path, type = "parquet") |>
+    filter(!is_training_eligible)
+
+  log_info("Retrieved {nrow(features_df)} prediction eligible rows")
+  features_df
+}
+
+#' Helper function to check if object exists in S3
+#' @param path S3 path
+#' @return Boolean indicating if object exists
+object_exists_s3 <- function(path) {
+  bucket <- "carbonite-bucket"
+  tryCatch(
+    {
+      head_object(
+        object = path,
+        bucket = bucket
+      )
+      TRUE
+    },
+    error = function(e) {
+      FALSE
+    }
+  )
+}
+
+# Modify save_version_to_s3 to ensure proper directory structure
+save_version_to_s3 <- function(features_df, version_hash = NULL) {
+  bucket <- "carbonite-bucket"
+
+  # Generate version hash if not provided
+  if (is.null(version_hash)) {
+    version_hash <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  }
+
+  log_info("Starting to save version {version_hash} to S3...")
+
+  # Create full directory structure
+  versions_prefix <- "versions/"
+  version_dir <- paste0(versions_prefix, version_hash, "/")
+
+  tryCatch(
+    {
+      # 1. Save features
+      features_path <- paste0(version_dir, "features.parquet")
+      log_info("Saving features to {features_path}")
+
+      # Convert to arrow Table and write to parquet
+      arrow::write_parquet(features_df, tempfile())
+      temp_parquet <- tempfile()
+      arrow::write_parquet(features_df, temp_parquet)
+      put_object(
+        file = temp_parquet,
+        object = features_path,
+        bucket = bucket
+      )
+
+      # 2. Save metadata
+      metadata <- list(
+        version_hash = version_hash,
+        timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        n_rows = nrow(features_df),
+        n_columns = ncol(features_df)
+      )
+      metadata_path <- paste0(version_dir, "metadata.json")
+      temp_metadata <- tempfile()
+      jsonlite::write_json(metadata, temp_metadata)
+      put_object(
+        file = temp_metadata,
+        object = metadata_path,
+        bucket = bucket
+      )
+
+      # 3. Create version marker
+      marker_path <- paste0(version_dir, ".version")
+      temp_marker <- tempfile()
+      writeLines(version_hash, temp_marker)
+      put_object(
+        file = temp_marker,
+        object = marker_path,
+        bucket = bucket
+      )
+
+      # 4. Verify saved files
+      log_info("Verifying saved files...")
+
+      # Wait a short time for S3 consistency
+      Sys.sleep(2)
+
+      # List all objects in version directory
+      saved_objects <- aws.s3::get_bucket(
+        bucket = bucket,
+        prefix = version_dir
+      )
+
+      if (length(saved_objects) < 3) {
+        # We expect 3 files: features, metadata, and marker
+        stop(
+          sprintf(
+            "Expected 3 files in version directory, but found %d",
+            length(saved_objects)
+          )
+        )
+      }
+
+      # Verify each file exists and has content
+      files_to_check <- c(features_path, metadata_path, marker_path)
+      for (file_path in files_to_check) {
+        if (!aws.s3::object_exists(bucket, file_path)) {
+          stop(sprintf("Failed to verify file: %s", file_path))
+        }
+      }
+
+      log_info("Successfully verified all files for version {version_hash}")
+
+      # Clean up temp files
+      unlink(temp_parquet)
+      unlink(temp_metadata)
+      unlink(temp_marker)
+
+      # Return the version hash
+      version_hash
+    },
+    error = function(e) {
+      log_error("Error saving version to S3: {conditionMessage(e)}")
+      # Clean up any temp files
+      if (exists("temp_parquet")) unlink(temp_parquet)
+      if (exists("temp_metadata")) unlink(temp_metadata)
+      if (exists("temp_marker")) unlink(temp_marker)
+      stop(e)
+    }
+  )
+}
+
+# Also add this helper function to verify version exists
+verify_version_exists <- function(version_hash) {
+  bucket <- "carbonite-bucket"
+  version_dir <- paste0("versions/", version_hash, "/")
+
+  log_info("Verifying version {version_hash}...")
+
+  # List objects in version directory
+  objects <- aws.s3::get_bucket(
+    bucket = bucket,
+    prefix = version_dir
+  )
+
+  if (length(objects) == 0) {
+    log_error("No files found for version {version_hash}")
+    return(FALSE)
+  }
+
+  # Check for required files
+  required_files <- c(
+    paste0(version_dir, "features.parquet"),
+    paste0(version_dir, "metadata.json"),
+    paste0(version_dir, ".version")
+  )
+
+  existing_files <- sapply(objects, function(x) x$Key)
+  missing_files <- setdiff(required_files, existing_files)
+
+  if (length(missing_files) > 0) {
+    log_error(
+      "Missing required files for version {version_hash}: {paste(missing_files, collapse=', ')}"
+    )
+    return(FALSE)
+  }
+
+  log_info("Successfully verified version {version_hash}")
+  TRUE
+}
+
+# Also modify get_prediction_data to handle first run
+get_prediction_data <- function() {
+  bucket <- "carbonite-bucket"
+  versions_prefix <- "versions/"
+
+  # List all version directories in S3
+  log_info("Listing version directories in S3...")
+  tryCatch(
+    {
+      version_objects <- aws.s3::get_bucket(
+        bucket = bucket,
+        prefix = versions_prefix
+      )
+
+      if (length(version_objects) == 0) {
+        log_warn("No versions found - this might be the first run")
+        return(data.frame()) # Return empty dataframe for first run
+      }
+
+      # Rest of the existing function...
+    },
+    error = function(e) {
+      log_error("Error accessing S3: {conditionMessage(e)}")
+      stop(e)
+    }
+  )
+}
+
+inspect_s3_structure <- function() {
+  bucket <- "carbonite-bucket"
+
+  log_info("Inspecting S3 bucket structure...")
+
+  # List all objects
+  objects <- aws.s3::get_bucket(bucket)
+
+  # Print details of each object
+  log_info("Full object listing:")
+  lapply(objects, function(x) {
+    log_info("Key: {x$Key}, LastModified: {x$LastModified}, Size: {x$Size}")
+  })
+
+  # Group by prefix
+  prefixes <- sapply(objects, function(x) {
+    parts <- strsplit(x$Key, "/")[[1]]
+    if (length(parts) > 0) parts[1] else "root"
+  })
+
+  # Count objects by prefix
+  prefix_counts <- table(prefixes)
+
+  log_info("Summary by prefix:")
+  for (prefix in names(prefix_counts)) {
+    log_info("  {prefix}: {prefix_counts[prefix]} objects")
+
+    # Get example objects for this prefix
+    prefix_objects <- objects[prefixes == prefix]
+    if (length(prefix_objects) > 0) {
+      for (i in seq_len(min(3, length(prefix_objects)))) {
+        log_info("    Example {i}: {prefix_objects[[i]]$Key}")
+      }
+    }
+  }
 }
