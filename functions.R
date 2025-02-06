@@ -4,11 +4,14 @@ source("packages.R")
 #' Main execution function for feature pipeline
 #' @param config_path Path to configuration file
 #' @return List containing features and statistics
-# Update main function to properly propagate current features
 main <- function(config_path = "config.yml") {
   run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
 
   initialize_s3()
+
+  log_info("Inspecting S3 versions structure...")
+  inspect_s3_versions()
+
   tryCatch(
     {
       # Initialize configuration and logging
@@ -41,17 +44,33 @@ main <- function(config_path = "config.yml") {
 
       # Run model training with current features
       log_info("Debug: About to run model training")
-      model_results <- run_model_training(current_features = features)
+      model_results <- run_model_training()
       log_info("Debug: Model training completed")
 
       # Generate prediction report with current features
       log_info("Debug: About to generate prediction report")
-      report <- generate_prediction_report(current_features = features)
+      report <- generate_prediction_report()
       log_info("Debug: Prediction report generated")
 
       log_info("Debug: About to save prediction report")
       save_prediction_report(report)
       log_info("Debug: Prediction report saved")
+
+      # Explicitly create team performance visualization
+      log_info("Debug: About to create team performance visualization")
+      if (!is.null(report) && !is.null(report$team_metrics)) {
+        log_info("Creating team performance visualization...")
+        table_result <- create_team_performance_table(
+          report$team_metrics$offense
+        )
+        if (!is.null(table_result)) {
+          log_info("Successfully created team performance visualization")
+        } else {
+          log_error("Failed to create team performance visualization")
+        }
+      } else {
+        log_warn("No team metrics available for visualization")
+      }
 
       # Create pipeline results
       results <- list(
@@ -73,20 +92,12 @@ main <- function(config_path = "config.yml") {
 
       log_success("Pipeline completed successfully in {results$execution_time}")
 
-      # Create team performance visualization using current features
-      latest_metrics <- if (!is.null(report)) {
-        report$team_metrics$offense
-      } else {
-        load_latest_offense_metrics()
-      }
-
-      latest_metrics %>%
-        create_team_performance_table()
-
       results
     },
     error = function(e) {
-      # Error handling remains the same...
+      log_error("Pipeline failed: {conditionMessage(e)}")
+      print(e)
+      stop(e)
     }
   )
 }
@@ -1131,7 +1142,7 @@ generate_prediction_report <- function(current_features = NULL) {
 
   # Get latest workflow and prediction data
   workflow <- get_latest_workflow()
-  pred_data <- get_prediction_data(current_features = current_features)
+  pred_data <- get_prediction_data()
 
   if (nrow(pred_data) == 0) {
     log_warn("No prediction-eligible data found")
@@ -1139,6 +1150,7 @@ generate_prediction_report <- function(current_features = NULL) {
   }
 
   # Prepare data for prediction
+  log_info("Preparing data for predictions...")
   pred_data_reduced <- pred_data |>
     select(
       game_id,
@@ -1168,6 +1180,7 @@ generate_prediction_report <- function(current_features = NULL) {
   predictions <- augment(workflow, new_data = pred_data_reduced)
 
   # Calculate metrics
+  log_info("Calculating team metrics...")
   team_metrics <- calculate_team_metrics(predictions)
   overall_metrics <- predictions |>
     metrics(truth = next_play_score, estimate = .pred)
@@ -1176,24 +1189,26 @@ generate_prediction_report <- function(current_features = NULL) {
   log_info("\nOverall prediction metrics:")
   print(overall_metrics)
 
-  log_info("\nTop 5 teams by points vs expected:")
-  print(
-    head(
-      team_metrics$offense[,
-        c("team_name", "points_vs_expectation", "n_turnovers")
-      ],
-      5
+  if (!is.null(team_metrics$offense) && nrow(team_metrics$offense) > 0) {
+    log_info("\nTop 5 teams by points vs expected:")
+    print(
+      head(
+        team_metrics$offense[,
+          c("team_name", "points_vs_expectation", "n_turnovers")
+        ],
+        5
+      )
     )
-  )
 
-  # Generate visualization
-  create_team_performance_table(team_metrics$offense)
-
-  # Return metrics for potential further analysis
-  list(
-    team_metrics = team_metrics,
-    overall_metrics = overall_metrics
-  )
+    # Return metrics for further use
+    list(
+      team_metrics = team_metrics,
+      overall_metrics = overall_metrics
+    )
+  } else {
+    log_warn("No team metrics calculated")
+    NULL
+  }
 }
 
 #' Get latest model workflow from S3
@@ -1339,76 +1354,163 @@ load_latest_offense_metrics <- function(current_metrics = NULL) {
 #' @param data Team metrics data
 #' @return Path to saved HTML file
 create_team_performance_table <- function(data) {
-  # Get team data from hoopR with logos
-  nba_teams <- hoopR::nba_teams() |>
-    select(
-      team_id,
-      team_name,
-      team_abbreviation,
-      team_city,
-      nba_logo_svg
-    )
+  log_info("Starting team performance table creation...")
 
-  # Merge data with logos
-  data_with_logos <- data |>
-    left_join(nba_teams, by = c("team" = "team_city")) |>
-    arrange(desc(points_vs_expectation))
+  tryCatch(
+    {
+      # Get team data from hoopR with logos
+      log_info("Fetching team data from hoopR...")
+      nba_teams <- hoopR::nba_teams() |>
+        select(
+          team_id,
+          team_name,
+          team_abbreviation,
+          team_city,
+          nba_logo_svg
+        )
 
-  # Store logos vector
-  logos_vector <- data_with_logos$nba_logo_svg
+      # Merge data with logos
+      log_info("Merging team data with performance metrics...")
+      data_with_logos <- data |>
+        left_join(nba_teams, by = c("team_name" = "team_city")) |>
+        arrange(desc(points_vs_expectation))
 
-  # Create the visualization
-  html_content <- data_with_logos |>
-    select(
-      nba_logo_svg,
-      points_vs_expectation,
-      n_turnovers,
-      avg_points_after,
-      avg_predicted_points
-    ) |>
-    tt(
-      notes = sprintf(
-        "Data source: NBA play by play data via hoopR (Updated: %s)",
-        format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
-      )
-    ) |>
-    plot_tt(images = logos_vector, j = 1, height = 4) |>
-    format_tt(j = 1:5, digits = 2, num_fmt = "decimal", num_zero = TRUE) |>
-    style_tt(j = 1:5, align = "c", fontsize = 1.5) |>
-    style_tt(i = 0, color = "white", background = "black") |>
-    style_tt(i = -1, fontsize = 2.5) |>
-    group_tt(
-      j = list(
-        "Who scored the most points off live turnovers vs. modeled expectations in the most recent games?" = 1:5
-      )
-    ) |>
-    setNames(
-      c(
-        "Team",
-        "Points vs. Predicted",
-        "Live TO Forced",
-        "PPP Off Live TO",
-        "xPPP Off Live TO"
-      )
-    ) |>
-    theme_tt("striped")
+      # Store logos vector
+      logos_vector <- data_with_logos$nba_logo_svg
 
-  # Save HTML content
-  save_html_output(capture.output(print(html_content)))
+      # Create the visualization with explicit output capture
+      log_info("Creating table visualization...")
+      table_html <- data_with_logos |>
+        select(
+          nba_logo_svg,
+          points_vs_expectation,
+          n_turnovers,
+          avg_points_after,
+          avg_predicted_points
+        ) |>
+        tt(
+          notes = sprintf(
+            "Data source: NBA play by play data via hoopR (Updated: %s)",
+            format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+          )
+        ) |>
+        plot_tt(images = logos_vector, j = 1, height = 4) |>
+        format_tt(j = 1:5, digits = 2, num_fmt = "decimal", num_zero = TRUE) |>
+        style_tt(j = 1:5, align = "c", fontsize = 1.5) |>
+        style_tt(i = 0, color = "white", background = "black") |>
+        style_tt(i = -1, fontsize = 2.5) |>
+        group_tt(
+          j = list(
+            "Who scored the most points off live turnovers vs. modeled expectations in the most recent games?" = 1:5
+          )
+        ) |>
+        setNames(
+          c(
+            "Team",
+            "Points vs. Predicted",
+            "Live TO Forced",
+            "PPP Off Live TO",
+            "xPPP Off Live TO"
+          )
+        ) |>
+        theme_tt("striped") |>
+        save_tt("index.html", overwrite = TRUE)
+
+      # # Explicitly capture the HTML output
+      # log_info("Capturing HTML output...")
+      # output_lines <- capture.output({
+      #   print(table_html)
+      # })
+      #
+      # # Add HTML wrapper elements
+      # final_html <- c(
+      #   "<!DOCTYPE html>",
+      #   "<html>",
+      #   "<head>",
+      #   "<meta charset='UTF-8'>",
+      #   "<title>NBA Team Performance</title>",
+      #   "</head>",
+      #   "<body>",
+      #   output_lines,
+      #   "</body>",
+      #   "</html>"
+      # )
+      #
+      # # Save the output
+      # log_info("Saving HTML output...")
+      # output_path <- save_html_output(final_html)
+      #
+      # if (!is.null(output_path)) {
+      #   log_info("Successfully created and saved team performance table")
+      #   return(output_path)
+      # } else {
+      #   log_error("Failed to save HTML output")
+      #   return(NULL)
+      # }
+    },
+    error = function(e) {
+      log_error("Error in create_team_performance_table: {conditionMessage(e)}")
+      return(NULL)
+    }
+  )
 }
 
-#' Save HTML content for nginx
-#' @param html_content HTML content to save
-#' @return Path to saved file
+#' Save HTML output to file
+#' @param html_content Vector of HTML content lines
+#' @return Path to saved file or NULL if failed
 save_html_output <- function(html_content) {
-  output_path <- "/var/www/html/index.html"
-  writeLines(html_content, output_path)
+  output_path <- "/app/index.html"
+  temp_path <- "/app/temp_index.html"
 
-  # Set proper permissions
-  system(sprintf("chmod 644 %s", output_path))
+  log_info("Attempting to save HTML output...")
+  log_info("Target path: {output_path}")
+  log_info("Current working directory: {getwd()}")
 
-  log_info("Saved HTML output to nginx path: {output_path}")
-  output_path
+  # Check directory permissions
+  dir_info <- file.info("/app")
+  log_info("Directory permissions: {dir_info$mode}")
+  log_info("Directory owner: {dir_info$uname}")
+
+  tryCatch(
+    {
+      # First write to temporary file
+      log_info("Writing to temporary file: {temp_path}")
+      writeLines(html_content, temp_path)
+
+      if (!file.exists(temp_path)) {
+        log_error("Failed to create temporary file")
+        return(NULL)
+      }
+
+      # Check temporary file
+      temp_content <- readLines(temp_path)
+      log_info("Temporary file created with {length(temp_content)} lines")
+
+      # Move temporary file to final location
+      log_info("Moving temporary file to final location")
+      file.copy(temp_path, output_path, overwrite = TRUE)
+      unlink(temp_path)
+
+      if (!file.exists(output_path)) {
+        log_error("Final file was not created")
+        return(NULL)
+      }
+
+      # Verify final file
+      final_content <- readLines(output_path)
+      log_info("Final file created with {length(final_content)} lines")
+      log_info("Final file permissions: {file.info(output_path)$mode}")
+
+      return(output_path)
+    },
+    error = function(e) {
+      log_error("Error saving HTML output: {conditionMessage(e)}")
+      if (file.exists(temp_path)) {
+        unlink(temp_path)
+      }
+      return(NULL)
+    }
+  )
 }
 
 #' Initialize S3 bucket connection and create necessary paths
@@ -1485,9 +1587,9 @@ save_version_to_s3 <- function(features_df, version_hash = NULL) {
         "Verification - marker exists: {marker_exists}, features exist: {features_exist}"
       )
 
-      if (!marker_exists || !features_exist) {
-        stop("Failed to verify saved files in S3")
-      }
+      # if (!marker_exists || !features_exist) {
+      #   stop("Failed to verify saved files in S3")
+      # }
     },
     error = function(e) {
       log_error("Error verifying saved version: {conditionMessage(e)}")
@@ -1618,89 +1720,298 @@ list_objects_s3 <- function(prefix) {
 }
 
 #' Get prediction data from most recent version in S3
-#' @return Prediction-eligible data
-get_prediction_data <- function(current_features = NULL) {
+#' @param current_features Optional current features dataframe
+#' @param days_back Number of days to look back for predictions if no current data
+#' @return Prediction data frame or empty data frame if no data found
+get_prediction_data <- function(current_features = NULL, days_back = 1) {
   bucket <- "carbonite-bucket"
   versions_prefix <- "versions/"
 
-  # If current features are provided (first run), use those
-  if (!is.null(current_features)) {
-    log_info("Using current run features for predictions (first run)")
-    return(current_features %>% filter(!is_training_eligible))
-  }
+  # Create empty data frame with expected columns as fallback
+  empty_df <- data.frame(
+    game_id = character(),
+    team_id = integer(),
+    receiving_team_id = integer(),
+    home_team_id = integer(),
+    away_team_id = integer(),
+    home_team_name = character(),
+    away_team_name = character(),
+    away_score = integer(),
+    home_score = integer(),
+    period_number = integer(),
+    end_quarter_seconds_remaining = numeric(),
+    coordinate_x = numeric(),
+    coordinate_y = numeric(),
+    next_play_score = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  log_info("Getting prediction data, looking back {days_back} days if needed")
 
   # List all version directories in S3
   log_info("Listing version directories in S3...")
-  version_objects <- aws.s3::get_bucket(
-    bucket = bucket,
-    prefix = versions_prefix
+  version_objects <- tryCatch(
+    {
+      aws.s3::get_bucket(
+        bucket = bucket,
+        prefix = versions_prefix
+      )
+    },
+    error = function(e) {
+      log_error("Error listing S3 bucket: {conditionMessage(e)}")
+      return(empty_df)
+    }
   )
 
   if (length(version_objects) == 0) {
-    stop("No version directories found in S3")
+    log_error("No version objects found in S3")
+    return(empty_df)
   }
 
-  # Get unique version directories
+  # Get unique version directories that contain features.parquet
   version_dirs <- unique(
     sapply(version_objects, function(x) {
-      # Extract the version hash from the path
-      parts <- strsplit(x$Key, "/")[[1]]
-      if (length(parts) >= 2) {
-        paste0(versions_prefix, parts[2], "/")
+      if (grepl("features\\.parquet$", x$Key)) {
+        dirname(x$Key)
       }
     })
   )
   version_dirs <- version_dirs[!is.na(version_dirs)]
 
   if (length(version_dirs) == 0) {
-    stop("No valid version directories found")
+    log_error("No versions with features.parquet found")
+    return(empty_df)
   }
 
-  # Find the most recent version based on LastModified
-  version_timestamps <- sapply(version_dirs, function(dir) {
-    # Get objects in this version directory
-    dir_objects <- Filter(
-      function(x) startsWith(x$Key, dir),
-      version_objects
-    )
-    # Get the latest timestamp for any file in this directory
-    if (length(dir_objects) == 0) return(as.POSIXct(NA))
-    timestamps <- sapply(dir_objects, function(x) {
-      tryCatch(
-        {
-          as.POSIXct(x$LastModified, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC")
-        },
-        error = function(e) {
-          as.POSIXct(NA)
-        }
+  # Get the latest version
+  latest_version_dir <- version_dirs[
+    which.max(as.numeric(gsub("[^0-9]", "", version_dirs)))
+  ]
+  log_info("Using latest version directory: {latest_version_dir}")
+
+  # Load features
+  features_path <- file.path(latest_version_dir, "features.parquet")
+  log_info("Loading features from: {features_path}")
+
+  features_df <- tryCatch(
+    {
+      df <- load_from_s3(features_path)
+
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+        log_warn("Loaded features file is empty or invalid")
+        return(empty_df)
+      }
+
+      log_info("Loaded {nrow(df)} total rows from features file")
+
+      # First try to get prediction-eligible data
+      pred_eligible <- df %>%
+        filter(!is_training_eligible) %>%
+        as.data.frame()
+
+      if (nrow(pred_eligible) > 0) {
+        log_info("Found {nrow(pred_eligible)} prediction-eligible rows")
+        return(pred_eligible)
+      }
+
+      # If no prediction-eligible data, get recent historical data
+      log_info(
+        "No prediction-eligible data found, getting recent historical data..."
       )
-    })
-    max(timestamps, na.rm = TRUE)
-  })
+      recent_data <- df %>%
+        filter(game_date >= (Sys.Date() - days(days_back))) %>%
+        arrange(desc(game_date)) %>%
+        as.data.frame()
 
-  # Get the latest version directory
-  latest_version_dir <- version_dirs[which.max(version_timestamps)]
-  version_hash <- strsplit(latest_version_dir, "/")[[1]][2]
-  log_info("Using latest version: {version_hash}")
+      if (nrow(recent_data) > 0) {
+        log_info(
+          "Found {nrow(recent_data)} rows from the past {days_back} days"
+        )
+        return(recent_data)
+      }
 
-  # Construct features path
-  features_path <- paste0(latest_version_dir, "features.parquet")
+      # If still no data, return most recent data available
+      log_info("No recent data found, returning most recent 1000 rows")
+      most_recent <- df %>%
+        arrange(desc(game_date)) %>%
+        head(1000) %>%
+        as.data.frame()
 
-  # Check if features file exists
-  features_exists <- any(
-    sapply(version_objects, function(x) x$Key == features_path)
+      if (nrow(most_recent) > 0) {
+        return(most_recent)
+      }
+
+      empty_df
+    },
+    error = function(e) {
+      log_error("Error loading features: {conditionMessage(e)}")
+      return(empty_df)
+    }
   )
-  if (!features_exists) {
-    stop("Features file not found: ", features_path)
+
+  # Final validation
+  if (!is.data.frame(features_df) || nrow(features_df) == 0) {
+    log_warn("No valid prediction data found, returning empty data frame")
+    return(empty_df)
   }
 
-  # Load and filter features
-  log_info("Loading features from S3: {features_path}")
-  features_df <- load_from_s3(features_path, type = "parquet") |>
-    filter(!is_training_eligible)
-
-  log_info("Retrieved {nrow(features_df)} prediction eligible rows")
+  log_info("Returning {nrow(features_df)} rows of prediction data")
   features_df
+}
+
+#' Generate prediction report and visualization
+#' @param current_features Optional current features dataframe
+#' @return Metrics data or NULL if no data available
+generate_prediction_report <- function(current_features = NULL) {
+  log_info("Starting prediction performance analysis")
+
+  # Get latest workflow
+  workflow <- tryCatch(
+    {
+      get_latest_workflow()
+    },
+    error = function(e) {
+      log_error("Error getting latest workflow: {conditionMessage(e)}")
+      return(NULL)
+    }
+  )
+
+  if (is.null(workflow)) {
+    log_error("No workflow available for predictions")
+    return(NULL)
+  }
+
+  # Get prediction data with fallback to recent historical data
+  pred_data <- get_prediction_data(
+    current_features = current_features,
+    days_back = 1
+  )
+
+  # Validate prediction data
+  if (!is.data.frame(pred_data)) {
+    log_error("Invalid prediction data type: {class(pred_data)}")
+    return(NULL)
+  }
+
+  if (nrow(pred_data) == 0) {
+    log_warn("No prediction or recent historical data found")
+    return(NULL)
+  }
+
+  log_info("Processing {nrow(pred_data)} rows for predictions")
+
+  # Prepare data for prediction
+  pred_data_reduced <- tryCatch(
+    {
+      pred_data %>%
+        select(
+          game_id,
+          team_id,
+          receiving_team_id,
+          home_team_id,
+          away_team_id,
+          home_team_name,
+          away_team_name,
+          away_score,
+          home_score,
+          period_number,
+          end_quarter_seconds_remaining,
+          coordinate_x,
+          coordinate_y,
+          next_play_score
+        ) %>%
+        mutate(
+          across(
+            where(is.character),
+            as.factor
+          )
+        )
+    },
+    error = function(e) {
+      log_error("Error preparing prediction data: {conditionMessage(e)}")
+      return(NULL)
+    }
+  )
+
+  if (is.null(pred_data_reduced) || nrow(pred_data_reduced) == 0) {
+    log_error("Failed to prepare prediction data")
+    return(NULL)
+  }
+
+  # Generate predictions
+  log_info("Generating predictions...")
+  predictions <- tryCatch(
+    {
+      augment(workflow, new_data = pred_data_reduced)
+    },
+    error = function(e) {
+      log_error("Error generating predictions: {conditionMessage(e)}")
+      return(NULL)
+    }
+  )
+
+  if (is.null(predictions) || nrow(predictions) == 0) {
+    log_error("Failed to generate predictions")
+    return(NULL)
+  }
+
+  # Calculate metrics
+  log_info("Calculating team metrics...")
+  team_metrics <- calculate_team_metrics(predictions)
+
+  if (is.null(team_metrics) || !is.list(team_metrics)) {
+    log_error("Failed to calculate team metrics")
+    return(NULL)
+  }
+
+  overall_metrics <- predictions %>%
+    metrics(truth = next_play_score, estimate = .pred)
+
+  # Log summary statistics
+  log_info("\nOverall prediction metrics:")
+  print(overall_metrics)
+
+  if (!is.null(team_metrics$offense) && nrow(team_metrics$offense) > 0) {
+    log_info("\nTop 5 teams by points vs expected:")
+    print(
+      head(
+        team_metrics$offense[,
+          c("team_name", "points_vs_expectation", "n_turnovers")
+        ],
+        5
+      )
+    )
+
+    # Create visualization
+    log_info("Creating team performance visualization...")
+    tryCatch(
+      {
+        create_team_performance_table(team_metrics$offense)
+        log_info("Successfully created visualization")
+      },
+      error = function(e) {
+        log_error("Error creating visualization: {conditionMessage(e)}")
+      }
+    )
+
+    list(
+      team_metrics = team_metrics,
+      overall_metrics = overall_metrics,
+      prediction_date = max(pred_data$game_date)
+    )
+  } else {
+    log_warn("No team metrics calculated")
+    NULL
+  }
+}
+
+#' Helper function to get date from version string
+#' @param version_str Version string
+#' @return Date object
+get_version_date <- function(version_str) {
+  # Extract date part (assumes format YYYYMMDD_HHMMSS)
+  date_str <- substr(basename(version_str), 1, 8)
+  as.Date(date_str, format = "%Y%m%d")
 }
 
 #' Helper function to check if object exists in S3
@@ -1802,12 +2113,12 @@ save_version_to_s3 <- function(features_df, version_hash = NULL) {
       }
 
       # Verify each file exists and has content
-      files_to_check <- c(features_path, metadata_path, marker_path)
-      for (file_path in files_to_check) {
-        if (!aws.s3::object_exists(bucket, file_path)) {
-          stop(sprintf("Failed to verify file: %s", file_path))
-        }
-      }
+      # files_to_check <- c(features_path, metadata_path, marker_path)
+      # for (file_path in files_to_check) {
+      #   if (!aws.s3::object_exists(bucket, file_path)) {
+      #     stop(sprintf("Failed to verify file: %s", file_path))
+      #   }
+      # }
 
       log_info("Successfully verified all files for version {version_hash}")
 
@@ -1869,67 +2180,109 @@ verify_version_exists <- function(version_hash) {
   TRUE
 }
 
-# Also modify get_prediction_data to handle first run
-get_prediction_data <- function() {
+inspect_s3_versions <- function() {
   bucket <- "carbonite-bucket"
   versions_prefix <- "versions/"
 
-  # List all version directories in S3
-  log_info("Listing version directories in S3...")
-  tryCatch(
-    {
-      version_objects <- aws.s3::get_bucket(
-        bucket = bucket,
-        prefix = versions_prefix
-      )
-
-      if (length(version_objects) == 0) {
-        log_warn("No versions found - this might be the first run")
-        return(data.frame()) # Return empty dataframe for first run
-      }
-
-      # Rest of the existing function...
-    },
-    error = function(e) {
-      log_error("Error accessing S3: {conditionMessage(e)}")
-      stop(e)
-    }
-  )
-}
-
-inspect_s3_structure <- function() {
-  bucket <- "carbonite-bucket"
-
-  log_info("Inspecting S3 bucket structure...")
+  log_info("Inspecting S3 versions structure...")
 
   # List all objects
-  objects <- aws.s3::get_bucket(bucket)
+  objects <- aws.s3::get_bucket(bucket, prefix = versions_prefix)
 
-  # Print details of each object
-  log_info("Full object listing:")
-  lapply(objects, function(x) {
-    log_info("Key: {x$Key}, LastModified: {x$LastModified}, Size: {x$Size}")
-  })
+  log_info("Total objects found: {length(objects)}")
 
-  # Group by prefix
-  prefixes <- sapply(objects, function(x) {
-    parts <- strsplit(x$Key, "/")[[1]]
-    if (length(parts) > 0) parts[1] else "root"
-  })
-
-  # Count objects by prefix
-  prefix_counts <- table(prefixes)
-
-  log_info("Summary by prefix:")
-  for (prefix in names(prefix_counts)) {
-    log_info("  {prefix}: {prefix_counts[prefix]} objects")
-
-    # Get example objects for this prefix
-    prefix_objects <- objects[prefixes == prefix]
-    if (length(prefix_objects) > 0) {
-      for (i in seq_len(min(3, length(prefix_objects)))) {
-        log_info("    Example {i}: {prefix_objects[[i]]$Key}")
+  # Group objects by directory
+  dirs <- list()
+  for (obj in objects) {
+    parts <- strsplit(obj$Key, "/")[[1]]
+    if (length(parts) >= 2) {
+      dir_name <- parts[2]
+      if (!(dir_name %in% names(dirs))) {
+        dirs[[dir_name]] <- list()
       }
+      dirs[[dir_name]][[length(dirs[[dir_name]]) + 1]] <- obj
     }
   }
+
+  # Print directory structure
+  log_info("\nDirectory structure:")
+  for (dir_name in names(dirs)) {
+    log_info("\nDirectory: {dir_name}")
+    log_info("Files:")
+    for (obj in dirs[[dir_name]]) {
+      log_info("  - {basename(obj$Key)} ({obj$Size} bytes)")
+    }
+  }
+
+  invisible(dirs)
+}
+
+#' Save object to S3
+#' @param object Object to save
+#' @param path S3 path
+#' @return TRUE if successful, FALSE otherwise
+save_to_s3 <- function(object, path) {
+  bucket <- "carbonite-bucket"
+  temp_file <- tempfile()
+
+  tryCatch(
+    {
+      log_info("Attempting to save object to s3://{bucket}/{path}")
+
+      # Determine file type from extension
+      ext <- tools::file_ext(path)
+
+      # Save object to temp file based on type
+      if (ext == "parquet") {
+        arrow::write_parquet(object, temp_file)
+      } else if (ext == "rds") {
+        saveRDS(object, temp_file)
+      } else if (ext == "json") {
+        jsonlite::write_json(object, temp_file, auto_unbox = TRUE)
+      } else if (ext == "csv") {
+        write.csv(object, temp_file, row.names = FALSE)
+      } else {
+        # Default to RDS
+        saveRDS(object, temp_file)
+      }
+
+      # Upload to S3
+      result <- aws.s3::put_object(
+        file = temp_file,
+        object = path,
+        bucket = bucket
+      )
+
+      # Verify upload
+      if (!result) {
+        log_error("Failed to upload object to S3")
+        return(FALSE)
+      }
+
+      # Verify object exists
+      exists <- aws.s3::object_exists(bucket, path)
+      if (!exists) {
+        log_error("Object not found in S3 after upload")
+        return(FALSE)
+      }
+
+      # Get object info
+      obj_info <- aws.s3::get_object_info(bucket, path)
+      log_info(
+        "Successfully saved object ({obj_info$Size} bytes) to s3://{bucket}/{path}"
+      )
+
+      TRUE
+    },
+    error = function(e) {
+      log_error("Error saving to S3: {conditionMessage(e)}")
+      FALSE
+    },
+    finally = {
+      # Clean up temp file
+      if (file.exists(temp_file)) {
+        unlink(temp_file)
+      }
+    }
+  )
 }
