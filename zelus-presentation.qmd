@@ -52,11 +52,13 @@ engine: knitr
 
 # Let's Architect
 
-# Diagram Here
+# {background-image="images/zelus_presentation_architecture.png" background-size="contain" background-repeat="no-repeat"}
 
 # xPPP Off Live Turnovers
 
-# Screen recording Rockets
+# {background-image="images/amen_steal_start.png" background-repeat="no-repeat"}
+
+# 1.07 {background-image="images/amen_steal_start.png" background-size="contain" background-repeat="no-repeat" background-opacity="0.7"}
 
 # Trade-offs
 
@@ -111,8 +113,4 @@ engine: knitr
 # Earlier unit testing
 
 # Q&A
-
-# {background-image="images/final_app_screenshot.png" background-size="contain" background-repeat="no-repeat"}
-
-# The Whole Game {background-image="images/final_app_screenshot.png" background-size="contain" background-repeat="no-repeat" background-opacity="0.7"}
 
