@@ -1,0 +1,118 @@
+---
+title: "Putting R in Prod"
+subtitle: "Fast and Slow"
+author: "Michael Mullarkey"
+format:
+  revealjs:
+    incremental: true
+    theme: blood
+    transition: fade
+    background-transition: fade
+    transition-speed: slow
+    chalkboard:
+      chalk-effect: 0.25
+      boardmarker-width: 5
+engine: knitr
+---
+
+```{css}
+.center h1 {
+  text-align: center;
+}
+```
+
+```{css}
+.center h2 {
+  text-align: center;
+}
+```
+
+#
+
+::: {style="text-align: center; margin-top: 1em"}
+[THE WHOLE GAME](https://d3dou0r7ap9itn.cloudfront.net/){preview-link="true" style="text-align: center"}
+:::
+
+# Agenda
+
+- Why?
+- Architecture
+- Trade-offs
+- Most challenging element
+- What would I do differently
+- Q&A
+
+# Why?
+
+# Love building
+
+# Secrets
+
+# Bring it all together
+
+# Let's Architect
+
+# Diagram Here
+
+# xPPP Off Live Turnovers
+
+# Screen recording Rockets
+
+# Trade-offs
+
+# New project
+
+# Chance to learn
+
+# First time putting R in prod
+
+# Diving in on R6
+
+# Tight timelines
+
+# Working demo
+
+# Optimize?
+
+# Sure, later
+
+# Tinytable vs. gt
+
+# Actions vs. Cloud
+
+# From 0 to 1
+
+# Start simpler
+
+# Could XGBoost everything
+
+# Linear model
+
+# Shiny is great
+
+# Static site
+
+# Challenge?
+
+# Feature store
+
+# Reason sold as add-on
+
+# R6?
+
+# Square peg, round hole
+
+# Different?
+
+# Court data viz
+
+# Trust first instinct
+
+# Earlier unit testing
+
+# Q&A
+
+# {background-image="images/final_app_screenshot.png" background-size="contain" background-repeat="no-repeat"}
+
+# The Whole Game {background-image="images/final_app_screenshot.png" background-size="contain" background-repeat="no-repeat" background-opacity="0.7"}
+
