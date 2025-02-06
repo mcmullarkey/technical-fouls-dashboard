@@ -4,13 +4,42 @@ source("packages.R")
 #' Main execution function for feature pipeline
 #' @param config_path Path to configuration file
 #' @return List containing features and statistics
-main <- function(config_path = "config.yml") {
+main <- function(config_path = "config.yml", static_only = FALSE) {
+  Sys.setenv(TZ = "America/Denver")
   run_id <- format(Sys.time(), "%Y%m%d_%H%M%S")
 
   initialize_s3()
 
-  log_info("Inspecting S3 versions structure...")
-  inspect_s3_versions()
+  tryCatch({
+    # Initialize configuration and logging
+    config <- load_config(config_path)
+    log_info("Starting pipeline. Run ID: {run_id}")
+
+    if (static_only) {
+      log_info("Running in static generation mode...")
+
+      # Load latest offense metrics directly
+      offense_metrics <- load_latest_offense_metrics()
+
+      if (!is.null(offense_metrics)) {
+        log_info("Creating team performance visualization...")
+        table_result <- create_team_performance_table(offense_metrics)
+
+        if (!is.null(table_result)) {
+          log_info("Successfully created team performance visualization")
+          return(list(status = "success", message = "Static content generated"))
+        } else {
+          log_error("Failed to create team performance visualization")
+          return(
+            list(status = "error", message = "Failed to generate visualization")
+          )
+        }
+      } else {
+        log_error("No metrics data available")
+        return(list(status = "error", message = "No metrics data available"))
+      }
+    }
+  })
 
   tryCatch(
     {
@@ -1312,42 +1341,56 @@ save_prediction_report <- function(report) {
 #' @return Data frame of offense metrics
 load_latest_offense_metrics <- function(current_metrics = NULL) {
   if (!is.null(current_metrics)) {
-    log_info("Using current run metrics (first run)")
+    log_info("Using current run metrics")
     return(current_metrics)
   }
+
   bucket <- Sys.getenv("AWS_S3_BUCKET")
 
-  # List prediction reports
+  # First try to get the most recent prediction report
   report_objects <- aws.s3::get_bucket(
     bucket = bucket,
     prefix = "prediction_reports/"
   )
 
-  if (length(report_objects) == 0) {
-    stop("No prediction reports found in S3 bucket")
-  }
-
-  # Find most recent offense metrics
-  metrics_objects <- Filter(
-    function(x) grepl("offense_metrics\\.parquet$", x$Key),
-    report_objects
-  )
-
-  if (length(metrics_objects) == 0) {
-    stop("No offense metrics files found in S3 bucket")
-  }
-
-  # Load most recent metrics
-  latest_metrics <- metrics_objects[[
-    which.max(sapply(metrics_objects, function(x) x$LastModified))
-  ]]
-
-  metrics_data <- load_from_s3(latest_metrics$Key) |>
-    mutate(
-      team = str_trim(team_name)
+  if (length(report_objects) > 0) {
+    # Find most recent offense metrics
+    metrics_objects <- Filter(
+      function(x) grepl("offense_metrics\\.csv$", x$Key),
+      report_objects
     )
 
-  metrics_data
+    if (length(metrics_objects) > 0) {
+      latest_metrics <- metrics_objects[[
+        which.max(sapply(metrics_objects, function(x) x$LastModified))
+      ]]
+
+      # Load the metrics
+      temp_file <- tempfile()
+      aws.s3::save_object(latest_metrics$Key, temp_file, bucket)
+      metrics_data <- read.csv(temp_file) %>%
+        mutate(team = str_trim(team_name))
+      unlink(temp_file)
+
+      return(metrics_data)
+    }
+  }
+
+  # Fallback: generate metrics from latest features
+  log_info("No recent metrics found, generating from latest features...")
+  latest_features <- get_prediction_data(days_back = 1)
+
+  if (nrow(latest_features) > 0) {
+    workflow <- get_latest_workflow()
+    if (!is.null(workflow)) {
+      predictions <- augment(workflow, new_data = latest_features)
+      team_metrics <- calculate_team_metrics(predictions)
+      return(team_metrics$offense)
+    }
+  }
+
+  log_warn("Could not load or generate metrics")
+  NULL
 }
 
 #' Create and save team performance visualization
@@ -1805,8 +1848,8 @@ get_prediction_data <- function(current_features = NULL, days_back = 1) {
       log_info("Loaded {nrow(df)} total rows from features file")
 
       # First try to get prediction-eligible data
-      pred_eligible <- df %>%
-        filter(!is_training_eligible) %>%
+      pred_eligible <- df |>
+        filter(!is_training_eligible) |>
         as.data.frame()
 
       if (nrow(pred_eligible) > 0) {
@@ -1819,7 +1862,7 @@ get_prediction_data <- function(current_features = NULL, days_back = 1) {
         "No prediction-eligible data found, getting recent historical data..."
       )
       recent_data <- df %>%
-        filter(game_date >= (Sys.Date() - days(days_back))) %>%
+        filter(game_date == (Sys.Date() - days(days_back))) %>%
         arrange(desc(game_date)) %>%
         as.data.frame()
 
@@ -1831,10 +1874,10 @@ get_prediction_data <- function(current_features = NULL, days_back = 1) {
       }
 
       # If still no data, return most recent data available
-      log_info("No recent data found, returning most recent 1000 rows")
+      log_info("No data from yesterday found, returning data from 2 days ago")
       most_recent <- df %>%
+        filter(game_date == (Sys.Date() - days(days_back + 1))) %>%
         arrange(desc(game_date)) %>%
-        head(1000) %>%
         as.data.frame()
 
       if (nrow(most_recent) > 0) {
@@ -2285,4 +2328,9 @@ save_to_s3 <- function(object, path) {
       }
     }
   )
+}
+
+# Add a new function for static generation
+generate_static_content <- function(config_path = "config.yml") {
+  main(config_path, static_only = TRUE)
 }
